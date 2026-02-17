@@ -22,8 +22,12 @@ app.post('/webhook', async (req, res) => {
   const runUrl = workflow.html_url;
   const actor = workflow.actor.login;
   const completedAt = new Date(workflow.completed_at);
+  const jobsUrl = workflow.jobs_url;
 
   console.log(`[Build] ${workflowName} - Status: ${conclusion}`);
+
+  // Fetch job details to get check runs and their results
+  let checkDetails = await fetchCheckRunDetails(jobsUrl);
 
   // Send to Discord
   await sendToDiscord({
@@ -32,7 +36,8 @@ app.post('/webhook', async (req, res) => {
     branch,
     runUrl,
     actor,
-    completedAt
+    completedAt,
+    checkDetails
   });
 
   res.status(200).json({ message: 'Webhook processed' });
@@ -43,7 +48,53 @@ app.get('/', (req, res) => {
   res.status(200).json({ message: 'GitHub APK Webhook is running' });
 });
 
-async function sendToDiscord({ status, workflowName, branch, runUrl, actor, completedAt }) {
+async function fetchCheckRunDetails(jobsUrl) {
+  try {
+    const response = await fetch(jobsUrl, {
+      headers: {
+        'Accept': 'application/vnd.github.v3+json'
+      }
+    });
+
+    if (!response.ok) {
+      console.error('[GitHub API] Failed to fetch jobs');
+      return null;
+    }
+
+    const jobsData = await response.json();
+    const jobs = jobsData.jobs || [];
+
+    let passedCount = 0;
+    let failedCount = 0;
+    let failedTests = [];
+
+    jobs.forEach(job => {
+      const steps = job.steps || [];
+      
+      steps.forEach(step => {
+        if (step.conclusion === 'success') {
+          passedCount++;
+        } else if (step.conclusion === 'failure') {
+          failedCount++;
+          // Extract test name from step name
+          failedTests.push(step.name);
+        }
+      });
+    });
+
+    return {
+      passed: passedCount,
+      failed: failedCount,
+      failedTests: failedTests,
+      total: passedCount + failedCount
+    };
+  } catch (error) {
+    console.error('[GitHub API] Error fetching check details:', error.message);
+    return null;
+  }
+}
+
+async function sendToDiscord({ status, workflowName, branch, runUrl, actor, completedAt, checkDetails }) {
   const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 
   if (!discordWebhookUrl) {
@@ -72,50 +123,48 @@ async function sendToDiscord({ status, workflowName, branch, runUrl, actor, comp
     statusText = status.toUpperCase();
   }
 
+  // Build fields array
+  const fields = [
+    {
+      name: 'Status',
+      value: `**${statusText}**`,
+      inline: true
+    }
+  ];
+
+  // Add check results if available
+  if (checkDetails && checkDetails.total > 0) {
+    const checkText = `✅ ${checkDetails.passed} / ${checkDetails.total} checks passed`;
+    fields.push({
+      name: 'Checks',
+      value: checkText,
+      inline: false
+    });
+
+    // Add failed tests if any
+    if (checkDetails.failedTests && checkDetails.failedTests.length > 0) {
+      const failedList = checkDetails.failedTests
+        .map(test => `❌ ${test}`)
+        .join('\n');
+      
+      fields.push({
+        name: 'Failed Tests',
+        value: failedList,
+        inline: false
+      });
+    }
+  }
+
   // Create the Discord embed message
   const discordMessage = {
     embeds: [
       {
         title: `${emoji} ${workflowName}`,
         color: color,
-        fields: [
-          {
-            name: 'Status',
-            value: `**${statusText}**`,
-            inline: true
-          },
-          {
-            name: 'Branch',
-            value: branch,
-            inline: true
-          },
-          {
-            name: 'Triggered by',
-            value: actor,
-            inline: true
-          },
-          {
-            name: 'Completed',
-            value: `<t:${Math.floor(completedAt.getTime() / 1000)}:R>`,
-            inline: false
-          }
-        ],
+        fields: fields,
         footer: {
           text: 'GitHub Actions APK Builder'
         }
-      }
-    ],
-    components: [
-      {
-        type: 1,
-        components: [
-          {
-            type: 2,
-            label: 'View Build',
-            style: 5,
-            url: runUrl
-          }
-        ]
       }
     ]
   };
