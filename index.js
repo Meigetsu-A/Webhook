@@ -1,10 +1,14 @@
-export default async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(405).send('Method Not Allowed');
-  }
+require('dotenv').config();
+const express = require('express');
+const app = express();
 
+app.use(express.json());
+
+app.post('/webhook', async (req, res) => {
   const event = req.headers['x-github-event'];
   const payload = req.body;
+
+  console.log(`[GitHub Webhook] Received event: ${event}`);
 
   // Only process workflow_run events
   if (event !== 'workflow_run') {
@@ -12,12 +16,14 @@ export default async function handler(req, res) {
   }
 
   const workflow = payload.workflow_run;
-  const conclusion = workflow.conclusion; // 'success' or 'failure'
+  const conclusion = workflow.conclusion;
   const workflowName = workflow.name;
   const branch = workflow.head_branch;
   const runUrl = workflow.html_url;
   const actor = workflow.actor.login;
   const completedAt = new Date(workflow.completed_at);
+
+  console.log(`[Build] ${workflowName} - Status: ${conclusion}`);
 
   // Send to Discord
   await sendToDiscord({
@@ -30,17 +36,22 @@ export default async function handler(req, res) {
   });
 
   res.status(200).json({ message: 'Webhook processed' });
-}
+});
+
+// Health check endpoint
+app.get('/', (req, res) => {
+  res.status(200).json({ message: 'GitHub APK Webhook is running' });
+});
 
 async function sendToDiscord({ status, workflowName, branch, runUrl, actor, completedAt }) {
   const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 
   if (!discordWebhookUrl) {
-    console.error('Discord webhook URL not configured');
+    console.error('[Discord] ERROR: DISCORD_WEBHOOK_URL not configured');
     return;
   }
 
-  // Pick color and emoji based on status
+  // Determine color and emoji based on status
   let color, emoji, statusText;
   
   if (status === 'success') {
@@ -61,7 +72,7 @@ async function sendToDiscord({ status, workflowName, branch, runUrl, actor, comp
     statusText = status.toUpperCase();
   }
 
-  // Create the Discord message
+  // Create the Discord embed message
   const discordMessage = {
     embeds: [
       {
@@ -81,6 +92,11 @@ async function sendToDiscord({ status, workflowName, branch, runUrl, actor, comp
           {
             name: 'Triggered by',
             value: actor,
+            inline: true
+          },
+          {
+            name: 'Completed',
+            value: `<t:${Math.floor(completedAt.getTime() / 1000)}:R>`,
             inline: false
           }
         ],
@@ -114,9 +130,17 @@ async function sendToDiscord({ status, workflowName, branch, runUrl, actor, comp
     });
 
     if (!response.ok) {
-      console.error('Failed to send Discord message:', response.status);
+      console.error(`[Discord] ERROR: Failed to send message (Status: ${response.status})`);
+    } else {
+      console.log('[Discord] ✅ Notification sent successfully');
     }
   } catch (error) {
-    console.error('Error sending Discord message:', error);
+    console.error('[Discord] ERROR:', error.message);
   }
-    }
+}
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🚀 Webhook server running on port ${PORT}`);
+  console.log(`📍 Webhook URL: http://localhost:${PORT}/webhook`);
+});
