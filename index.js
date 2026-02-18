@@ -23,11 +23,16 @@ app.post('/webhook', async (req, res) => {
   const actor = workflow.actor.login;
   const completedAt = new Date(workflow.completed_at);
   const jobsUrl = workflow.jobs_url;
+  const headSha = workflow.head_sha;
+  const repoUrl = workflow.repository.url;
 
   console.log(`[Build] ${workflowName} - Status: ${conclusion}`);
 
   // Fetch job details to get check runs and their results
   let checkDetails = await fetchCheckRunDetails(jobsUrl);
+
+  // Fetch commit statistics for lines added and deleted
+  let commitStats = await fetchCommitStats(repoUrl, headSha);
 
   // Send to Discord
   await sendToDiscord({
@@ -37,7 +42,8 @@ app.post('/webhook', async (req, res) => {
     runUrl,
     actor,
     completedAt,
-    checkDetails
+    checkDetails,
+    commitStats
   });
 
   res.status(200).json({ message: 'Webhook processed' });
@@ -47,6 +53,52 @@ app.post('/webhook', async (req, res) => {
 app.get('/', (req, res) => {
   res.status(200).json({ message: 'GitHub APK Webhook is running' });
 });
+
+async function fetchCommitStats(repoUrl, sha) {
+  try {
+    const commitUrl = `${repoUrl}/commits/${sha}`;
+    const response = await fetch(commitUrl, {
+      headers: {
+        'Accept': 'application/vnd.github.v3+json'
+      }
+    });
+
+    if (!response.ok) {
+      console.error('[GitHub API] Failed to fetch commit stats');
+      return null;
+    }
+
+    const commitData = await response.json();
+    const files = commitData.files || [];
+    
+    let filesAdded = 0;
+    let filesModified = 0;
+    let filesDeleted = 0;
+
+    files.forEach(file => {
+      if (file.status === 'added') {
+        filesAdded++;
+      } else if (file.status === 'modified') {
+        filesModified++;
+      } else if (file.status === 'deleted') {
+        filesDeleted++;
+      }
+    });
+    
+    return {
+      additions: commitData.stats?.additions || 0,
+      deletions: commitData.stats?.deletions || 0,
+      total: (commitData.stats?.additions || 0) + (commitData.stats?.deletions || 0),
+      filesAdded: filesAdded,
+      filesModified: filesModified,
+      filesDeleted: filesDeleted,
+      filesTotal: files.length
+    };
+  } catch (error) {
+    console.error('[GitHub API] Error fetching commit stats:', error.message);
+    return null;
+  }
+}
 
 async function fetchCheckRunDetails(jobsUrl) {
   try {
@@ -94,7 +146,7 @@ async function fetchCheckRunDetails(jobsUrl) {
   }
 }
 
-async function sendToDiscord({ status, workflowName, branch, runUrl, actor, completedAt, checkDetails }) {
+async function sendToDiscord({ status, workflowName, branch, runUrl, actor, completedAt, checkDetails, commitStats }) {
   const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 
   if (!discordWebhookUrl) {
@@ -153,6 +205,24 @@ async function sendToDiscord({ status, workflowName, branch, runUrl, actor, comp
         inline: false
       });
     }
+  }
+
+  // Add commit statistics if available
+  if (commitStats) {
+    const statsText = `➕ ${commitStats.additions} additions\n➖ ${commitStats.deletions} deletions`;
+    fields.push({
+      name: 'Lines Changed',
+      value: statsText,
+      inline: false
+    });
+
+    // Add files changed information
+    const filesText = `📄 ${commitStats.filesAdded} added\n✏️ ${commitStats.filesModified} modified\n🗑️ ${commitStats.filesDeleted} deleted`;
+    fields.push({
+      name: 'Files Changed',
+      value: filesText,
+      inline: false
+    });
   }
 
   // Create the Discord embed message
