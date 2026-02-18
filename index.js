@@ -209,7 +209,7 @@ async function sendToDiscord({ status, workflowName, branch, runUrl, actor, comp
 
   // Add commit statistics if available
   if (commitStats) {
-    const statsText = `➕ ${commitStats.additions} additions\n➖ ${commitStats.deletions} deletions`;
+    const statsText = `• ${commitStats.additions} additions\n• ${commitStats.deletions} deletions`;
     fields.push({
       name: 'Lines Changed',
       value: statsText,
@@ -217,7 +217,7 @@ async function sendToDiscord({ status, workflowName, branch, runUrl, actor, comp
     });
 
     // Add files changed information
-    const filesText = `📄 ${commitStats.filesAdded} added\n✏️ ${commitStats.filesModified} modified\n🗑️ ${commitStats.filesDeleted} deleted`;
+    const filesText = `• ${commitStats.filesAdded} added\n• ${commitStats.filesModified} modified\n• ${commitStats.filesDeleted} deleted`;
     fields.push({
       name: 'Files Changed',
       value: filesText,
@@ -233,7 +233,7 @@ async function sendToDiscord({ status, workflowName, branch, runUrl, actor, comp
         color: color,
         fields: fields,
         footer: {
-          text: 'GitHub Actions APK Builder'
+          text: commitStats ? `Total: ${commitStats.total} lines • ${commitStats.filesTotal} files` : 'GitHub Actions APK Builder'
         }
       }
     ]
