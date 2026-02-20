@@ -1,265 +1,228 @@
-require('dotenv').config();
-const express = require('express');
-const app = express();
+const http = require("http");
+const https = require("https");
 
-app.use(express.json());
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+const PORT = process.env.PORT || 3000;
 
-app.post('/webhook', async (req, res) => {
-  const event = req.headers['x-github-event'];
-  const payload = req.body;
+function sendDiscordEmbed(embed) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ embeds: [embed] });
+    const url = new URL(DISCORD_WEBHOOK_URL);
 
-  console.log(`[GitHub Webhook] Received event: ${event}`);
+    const options = {
+      hostname: url.hostname,
+      path: url.pathname + url.search,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    };
 
-  // Only process workflow_run events
-  if (event !== 'workflow_run') {
-    return res.status(200).json({ message: 'Event ignored' });
-  }
+    const req = https.request(options, (res) => {
+      res.on("data", () => {});
+      res.on("end", resolve);
+    });
 
-  const workflow = payload.workflow_run;
-  const conclusion = workflow.conclusion;
-  const workflowName = workflow.name;
-  const branch = workflow.head_branch;
-  const runUrl = workflow.html_url;
-  const actor = workflow.actor.login;
-  const completedAt = new Date(workflow.completed_at);
-  const jobsUrl = workflow.jobs_url;
-  const headSha = workflow.head_sha;
-  const repoUrl = workflow.repository.url;
-
-  console.log(`[Build] ${workflowName} - Status: ${conclusion}`);
-
-  // Fetch job details to get check runs and their results
-  let checkDetails = await fetchCheckRunDetails(jobsUrl);
-
-  // Fetch commit statistics for lines added and deleted
-  let commitStats = await fetchCommitStats(repoUrl, headSha);
-
-  // Send to Discord
-  await sendToDiscord({
-    status: conclusion,
-    workflowName,
-    branch,
-    runUrl,
-    actor,
-    completedAt,
-    checkDetails,
-    commitStats
+    req.on("error", reject);
+    req.write(body);
+    req.end();
   });
-
-  res.status(200).json({ message: 'Webhook processed' });
-});
-
-// Health check endpoint
-app.get('/', (req, res) => {
-  res.status(200).json({ message: 'GitHub APK Webhook is running' });
-});
-
-async function fetchCommitStats(repoUrl, sha) {
-  try {
-    const commitUrl = `${repoUrl}/commits/${sha}`;
-    const response = await fetch(commitUrl, {
-      headers: {
-        'Accept': 'application/vnd.github.v3+json'
-      }
-    });
-
-    if (!response.ok) {
-      console.error('[GitHub API] Failed to fetch commit stats');
-      return null;
-    }
-
-    const commitData = await response.json();
-    const files = commitData.files || [];
-    
-    let filesAdded = 0;
-    let filesModified = 0;
-    let filesDeleted = 0;
-
-    files.forEach(file => {
-      if (file.status === 'added') {
-        filesAdded++;
-      } else if (file.status === 'modified') {
-        filesModified++;
-      } else if (file.status === 'deleted') {
-        filesDeleted++;
-      }
-    });
-    
-    return {
-      additions: commitData.stats?.additions || 0,
-      deletions: commitData.stats?.deletions || 0,
-      total: (commitData.stats?.additions || 0) + (commitData.stats?.deletions || 0),
-      filesAdded: filesAdded,
-      filesModified: filesModified,
-      filesDeleted: filesDeleted,
-      filesTotal: files.length
-    };
-  } catch (error) {
-    console.error('[GitHub API] Error fetching commit stats:', error.message);
-    return null;
-  }
 }
 
-async function fetchCheckRunDetails(jobsUrl) {
-  try {
-    const response = await fetch(jobsUrl, {
-      headers: {
-        'Accept': 'application/vnd.github.v3+json'
+function parseBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (chunk) => (data += chunk));
+    req.on("end", () => {
+      try {
+        resolve(JSON.parse(data));
+      } catch {
+        reject(new Error("Invalid JSON"));
       }
     });
-
-    if (!response.ok) {
-      console.error('[GitHub API] Failed to fetch jobs');
-      return null;
-    }
-
-    const jobsData = await response.json();
-    const jobs = jobsData.jobs || [];
-
-    let passedCount = 0;
-    let failedCount = 0;
-    let failedTests = [];
-
-    jobs.forEach(job => {
-      const steps = job.steps || [];
-      
-      steps.forEach(step => {
-        if (step.conclusion === 'success') {
-          passedCount++;
-        } else if (step.conclusion === 'failure') {
-          failedCount++;
-          // Extract test name from step name
-          failedTests.push(step.name);
-        }
-      });
-    });
-
-    return {
-      passed: passedCount,
-      failed: failedCount,
-      failedTests: failedTests,
-      total: passedCount + failedCount
-    };
-  } catch (error) {
-    console.error('[GitHub API] Error fetching check details:', error.message);
-    return null;
-  }
+  });
 }
 
-async function sendToDiscord({ status, workflowName, branch, runUrl, actor, completedAt, checkDetails, commitStats }) {
-  const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
+async function handleWorkflowRun(payload) {
+  const run = payload.workflow_run;
+  if (!run) return;
 
-  if (!discordWebhookUrl) {
-    console.error('[Discord] ERROR: DISCORD_WEBHOOK_URL not configured');
-    return;
+  const status = run.conclusion; // success, failure, cancelled, etc.
+  const failed = status !== "success" && status !== null;
+  const isPending = status === null;
+
+  if (isPending) return; // Only fire when complete
+
+  // Gather failed jobs info if failed
+  let failedJobsText = "";
+  let locAdded = 0;
+  let filesChanged = 0;
+  let fileLOCLines = [];
+
+  // Try to get jobs data from the jobs_url
+  if (failed && run.jobs_url) {
+    try {
+      const jobsData = await fetchJSON(run.jobs_url + "?per_page=100");
+      const failedJobs = (jobsData.jobs || []).filter(
+        (j) => j.conclusion === "failure"
+      );
+
+      if (failedJobs.length > 0) {
+        failedJobsText = failedJobs
+          .map((job) => {
+            const failedSteps = job.steps
+              .filter((s) => s.conclusion === "failure")
+              .map((s) => `    ↳ Step: **${s.name}**`)
+              .join("\n");
+            return `❌ **${job.name}**\n${failedSteps || "    ↳ Unknown step"}`;
+          })
+          .join("\n\n");
+      }
+    } catch (e) {
+      failedJobsText = "Could not retrieve job details.";
+    }
   }
 
-  // Determine color and emoji based on status
-  let color, emoji, statusText;
-  
-  if (status === 'success') {
-    color = 3066993; // Green
-    emoji = '✅';
-    statusText = 'BUILD SUCCESSFUL';
-  } else if (status === 'failure') {
-    color = 15158332; // Red
-    emoji = '❌';
-    statusText = 'BUILD FAILED';
-  } else if (status === 'cancelled') {
-    color = 9807270; // Gray
-    emoji = '⏹️';
-    statusText = 'BUILD CANCELLED';
-  } else {
-    color = 9807270;
-    emoji = '⚠️';
-    statusText = status.toUpperCase();
+  // Get commit LOC stats via GitHub compare API
+  // run.head_sha is the commit sha
+  if (run.repository && run.head_sha) {
+    try {
+      const repoFullName = run.repository.full_name;
+      const sha = run.head_sha;
+      const commitData = await fetchJSON(
+        `https://api.github.com/repos/${repoFullName}/commits/${sha}`
+      );
+
+      if (commitData.stats) {
+        locAdded = commitData.stats.additions || 0;
+      }
+
+      if (commitData.files && commitData.files.length > 0) {
+        filesChanged = commitData.files.length;
+        fileLOCLines = commitData.files.map((f) => {
+          const name = f.filename.split("/").pop();
+          return `\`${name}\` — +${f.additions} / -${f.deletions} (${f.changes} changes)`;
+        });
+      }
+    } catch (e) {
+      // Stats unavailable
+    }
   }
 
-  // Build fields array
+  const color = failed ? 0xe74c3c : 0x2ecc71;
+  const statusLabel = failed
+    ? `❌ FAILED (${status})`
+    : "✅ PASSED";
+
   const fields = [
     {
-      name: 'Status',
-      value: `**${statusText}**`,
-      inline: true
-    }
+      name: "🔁 Workflow",
+      value: `\`${run.name}\``,
+      inline: true,
+    },
+    {
+      name: "📊 Status",
+      value: statusLabel,
+      inline: true,
+    },
   ];
 
-  // Add check results if available
-  if (checkDetails && checkDetails.total > 0) {
-    const checkText = `✅ ${checkDetails.passed} / ${checkDetails.total} checks passed`;
+  if (failed && failedJobsText) {
     fields.push({
-      name: 'Checks',
-      value: checkText,
-      inline: false
-    });
-
-    // Add failed tests if any
-    if (checkDetails.failedTests && checkDetails.failedTests.length > 0) {
-      const failedList = checkDetails.failedTests
-        .map(test => `❌ ${test}`)
-        .join('\n');
-      
-      fields.push({
-        name: 'Failed Tests',
-        value: failedList,
-        inline: false
-      });
-    }
-  }
-
-  // Add commit statistics if available
-  if (commitStats) {
-    const statsText = `• ${commitStats.additions} additions\n• ${commitStats.deletions} deletions`;
-    fields.push({
-      name: 'Lines Changed',
-      value: statsText,
-      inline: false
-    });
-
-    // Add files changed information
-    const filesText = `• ${commitStats.filesAdded} added\n• ${commitStats.filesModified} modified\n• ${commitStats.filesDeleted} deleted`;
-    fields.push({
-      name: 'Files Changed',
-      value: filesText,
-      inline: false
+      name: "💥 Failed Jobs & Steps",
+      value: failedJobsText.slice(0, 1024),
+      inline: false,
     });
   }
 
-  // Create the Discord embed message
-  const discordMessage = {
-    embeds: [
-      {
-        title: `${emoji} ${workflowName}`,
-        color: color,
-        fields: fields,
-        footer: {
-          text: commitStats ? `Total: ${commitStats.total} lines • ${commitStats.filesTotal} files` : 'GitHub Actions APK Builder'
-        }
-      }
-    ]
+  fields.push({
+    name: "📝 Lines Added (this commit)",
+    value: `**+${locAdded}** lines`,
+    inline: true,
+  });
+
+  fields.push({
+    name: "📁 Files Changed",
+    value: `**${filesChanged}** file${filesChanged !== 1 ? "s" : ""}`,
+    inline: true,
+  });
+
+  if (fileLOCLines.length > 0) {
+    const locSummary = fileLOCLines.join("\n").slice(0, 1024);
+    fields.push({
+      name: "📂 File Breakdown (LOC)",
+      value: locSummary,
+      inline: false,
+    });
+  }
+
+  const embed = {
+    title: failed
+      ? "🚨 GitHub Actions — Build Failed"
+      : "✅ GitHub Actions — Build Passed",
+    color,
+    fields,
+    footer: {
+      text: `Run #${run.run_number} • ${new Date(run.updated_at).toUTCString()}`,
+    },
   };
 
-  try {
-    const response = await fetch(discordWebhookUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(discordMessage)
-    });
-
-    if (!response.ok) {
-      console.error(`[Discord] ERROR: Failed to send message (Status: ${response.status})`);
-    } else {
-      console.log('[Discord] ✅ Notification sent successfully');
-    }
-  } catch (error) {
-    console.error('[Discord] ERROR:', error.message);
-  }
+  await sendDiscordEmbed(embed);
 }
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 Webhook server running on port ${PORT}`);
-  console.log(`📍 Webhook URL: http://localhost:${PORT}/webhook`);
+function fetchJSON(url) {
+  return new Promise((resolve, reject) => {
+    const parsedUrl = new URL(url);
+    const options = {
+      hostname: parsedUrl.hostname,
+      path: parsedUrl.pathname + parsedUrl.search,
+      headers: {
+        "User-Agent": "webhook-bot",
+        Accept: "application/vnd.github+json",
+      },
+    };
+
+    https.get(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch {
+          reject(new Error("JSON parse error"));
+        }
+      });
+    }).on("error", reject);
+  });
+}
+
+const server = http.createServer(async (req, res) => {
+  if (req.method !== "POST") {
+    res.writeHead(405);
+    return res.end("Method Not Allowed");
+  }
+
+  const event = req.headers["x-github-event"];
+
+  try {
+    const payload = await parseBody(req);
+
+    if (event === "workflow_run") {
+      await handleWorkflowRun(payload);
+      res.writeHead(200);
+      res.end("OK");
+    } else {
+      res.writeHead(200);
+      res.end("Ignored");
+    }
+  } catch (err) {
+    console.error("Error:", err);
+    res.writeHead(500);
+    res.end("Internal Server Error");
+  }
+});
+
+server.listen(PORT, () => {
+  console.log(`Webhook server running on port ${PORT}`);
 });
