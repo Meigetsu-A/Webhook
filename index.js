@@ -70,42 +70,6 @@ function fetchJSON(url) {
   });
 }
 
-async function getFullBranchStats(repoFullName, sha) {
-  let totalLOC = 0;
-  let totalFiles = 0;
-
-  // Walk the full git tree at this sha
-  const treeData = await fetchJSON(
-    `https://api.github.com/repos/${repoFullName}/git/trees/${sha}?recursive=1`
-  );
-
-  const blobs = (treeData.tree || []).filter((item) => item.type === "blob");
-  totalFiles = blobs.length;
-
-  // Count lines in each file, batched to avoid rate limits
-  const batchSize = 10;
-  for (let i = 0; i < blobs.length; i += batchSize) {
-    const batch = blobs.slice(i, i + batchSize);
-    await Promise.all(
-      batch.map(async (blob) => {
-        try {
-          const blobData = await fetchJSON(
-            `https://api.github.com/repos/${repoFullName}/git/blobs/${blob.sha}`
-          );
-          if (blobData.encoding === "base64" && blobData.content) {
-            const content = Buffer.from(blobData.content, "base64").toString("utf8");
-            totalLOC += content.split("\n").length;
-          }
-        } catch {
-          // Skip binaries or unreadable blobs
-        }
-      })
-    );
-  }
-
-  return { totalLOC, totalFiles };
-}
-
 async function handleWorkflowRun(payload) {
   const run = payload.workflow_run;
   if (!run) return;
@@ -114,17 +78,12 @@ async function handleWorkflowRun(payload) {
   const failed = status !== "success" && status !== null;
   const isPending = status === null;
 
-  if (isPending) return; // Only notify when run is complete
+  if (isPending) return; // Only notify when complete
 
   let failedJobsText = "";
   let locAdded = 0;
   let filesChanged = 0;
   let fileLOCLines = [];
-  let totalBranchLOC = 0;
-  let totalBranchFiles = 0;
-
-  const repoFullName = run.repository?.full_name;
-  const sha = run.head_sha;
 
   // Get failed jobs and steps
   if (failed && run.jobs_url) {
@@ -150,9 +109,11 @@ async function handleWorkflowRun(payload) {
     }
   }
 
-  if (repoFullName && sha) {
-    // This commit's additions and per-file breakdown
+  // This commit's additions and per-file breakdown
+  if (run.repository && run.head_sha) {
     try {
+      const repoFullName = run.repository.full_name;
+      const sha = run.head_sha;
       const commitData = await fetchJSON(
         `https://api.github.com/repos/${repoFullName}/commits/${sha}`
       );
@@ -168,15 +129,6 @@ async function handleWorkflowRun(payload) {
           return `\`${name}\` — +${f.additions} / -${f.deletions} (${f.changes} changes)`;
         });
       }
-    } catch {
-      // Unavailable
-    }
-
-    // Full branch total LOC + file count
-    try {
-      const stats = await getFullBranchStats(repoFullName, sha);
-      totalBranchLOC = stats.totalLOC;
-      totalBranchFiles = stats.totalFiles;
     } catch {
       // Unavailable
     }
@@ -206,7 +158,6 @@ async function handleWorkflowRun(payload) {
     });
   }
 
-  // This commit stats
   fields.push({
     name: "📝 Lines Added (this commit)",
     value: `**+${locAdded.toLocaleString()}** lines`,
@@ -220,7 +171,7 @@ async function handleWorkflowRun(payload) {
   });
 
   if (fileLOCLines.length > 0) {
-    // Split file list into multiple fields to respect Discord's 1024 char limit per field
+    // Chunk file list into multiple fields to respect Discord's 1024 char limit
     const chunks = [];
     let current = "";
     for (const line of fileLOCLines) {
@@ -234,8 +185,8 @@ async function handleWorkflowRun(payload) {
     }
     if (current) chunks.push(current);
 
-    // Discord allows max 25 fields total, leave room for other fields
-    const maxChunks = Math.min(chunks.length, 25 - fields.length - 2);
+    // Max 25 fields in a Discord embed
+    const maxChunks = Math.min(chunks.length, 25 - fields.length);
     chunks.slice(0, maxChunks).forEach((chunk, i) => {
       fields.push({
         name: i === 0
@@ -247,19 +198,6 @@ async function handleWorkflowRun(payload) {
     });
   }
 
-  // Full branch totals
-  fields.push({
-    name: "🗂️ Total Files in Branch",
-    value: `**${totalBranchFiles.toLocaleString()}** files`,
-    inline: true,
-  });
-
-  fields.push({
-    name: "📏 Total LOC in Branch",
-    value: `**${totalBranchLOC.toLocaleString()}** lines`,
-    inline: true,
-  });
-
   const embed = {
     title: failed
       ? "🚨 GitHub Actions — Build Failed"
@@ -267,7 +205,7 @@ async function handleWorkflowRun(payload) {
     color,
     fields,
     footer: {
-      text: `Run #${run.run_number}`,
+      text: `Run #${run.run_number} • ${new Date(run.updated_at).toUTCString()}`,
     },
   };
 
