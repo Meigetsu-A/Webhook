@@ -1,243 +1,153 @@
-const http = require("http");
-const https = require("https");
+require("dotenv").config();
+const http   = require("http");
+const crypto = require("crypto");
+const https  = require("https");
 
-const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
-const PORT = process.env.PORT || 3000;
+const SECRET              = process.env.GITHUB_WEBHOOK_SECRET || "";
+const PORT                = process.env.PORT || 3000;
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || "";
 
-function sendDiscordEmbed(embed) {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ embeds: [embed] });
-    const url = new URL(DISCORD_WEBHOOK_URL);
+function verifySignature(payload, signature) {
+  if (!SECRET || !signature) return true;
+  const hmac   = crypto.createHmac("sha256", SECRET);
+  const digest = "sha256=" + hmac.update(payload).digest("hex");
+  try {
+    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature));
+  } catch {
+    return false;
+  }
+}
 
-    const options = {
-      hostname: url.hostname,
-      path: url.pathname + url.search,
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(body),
-      },
-    };
-
-    const req = https.request(options, (res) => {
-      res.on("data", () => {});
-      res.on("end", resolve);
-    });
-
-    req.on("error", reject);
-    req.write(body);
-    req.end();
+function formatDate(isoString) {
+  if (!isoString) return "—";
+  return new Date(isoString).toLocaleString("en-US", {
+    month:  "short",
+    day:    "numeric",
+    year:   "numeric",
+    hour:   "2-digit",
+    minute: "2-digit",
   });
 }
 
-function parseBody(req) {
-  return new Promise((resolve, reject) => {
-    let data = "";
-    req.on("data", (chunk) => (data += chunk));
-    req.on("end", () => {
-      try {
-        resolve(JSON.parse(data));
-      } catch {
-        reject(new Error("Invalid JSON"));
-      }
-    });
-  });
+function getDuration(startedAt, completedAt) {
+  if (!startedAt || !completedAt) return null;
+  const ms = new Date(completedAt) - new Date(startedAt);
+  const s  = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return r > 0 ? `${m}m ${r}s` : `${m}m`;
 }
 
-function fetchJSON(url) {
-  return new Promise((resolve, reject) => {
-    const parsedUrl = new URL(url);
-    const options = {
-      hostname: parsedUrl.hostname,
-      path: parsedUrl.pathname + parsedUrl.search,
-      headers: {
-        "User-Agent": "webhook-bot",
-        Accept: "application/vnd.github+json",
-      },
-    };
-
-    https.get(options, (res) => {
-      let data = "";
-      res.on("data", (chunk) => (data += chunk));
-      res.on("end", () => {
-        try {
-          resolve(JSON.parse(data));
-        } catch {
-          reject(new Error("JSON parse error"));
-        }
-      });
-    }).on("error", reject);
-  });
+function stepIcon(status, conclusion) {
+  if (status === "in_progress") return "🔄";
+  if (status === "queued")      return "⏳";
+  if (conclusion === "success") return "✅";
+  if (conclusion === "failure") return "❌";
+  if (conclusion === "skipped") return "⏭️";
+  return "❓";
 }
 
-async function handleWorkflowRun(payload) {
-  const run = payload.workflow_run;
-  if (!run) return;
+function buildMessage(repo, jobName, status, conclusion, date, steps) {
+  const label = conclusion || status;
 
-  const status = run.conclusion;
-  const failed = status !== "success" && status !== null;
-  const isPending = status === null;
+  const totalDuration = steps.length > 0
+    ? getDuration(
+        steps.find(s => s.started_at)?.started_at,
+        [...steps].reverse().find(s => s.completed_at)?.completed_at
+      )
+    : null;
 
-  if (isPending) return; // Only notify when complete
+  const lines = [];
+  lines.push(`- **${repo}**`);
+  lines.push(`  ${jobName} · ${label}${totalDuration ? ` · ${totalDuration}` : ""}`);
+  lines.push(`  ${date}`);
 
-  let failedJobsText = "";
-  let locAdded = 0;
-  let filesChanged = 0;
-  let fileLOCLines = [];
-
-  // Get failed jobs and steps
-  if (failed && run.jobs_url) {
-    try {
-      const jobsData = await fetchJSON(run.jobs_url + "?per_page=100");
-      const failedJobs = (jobsData.jobs || []).filter(
-        (j) => j.conclusion === "failure"
-      );
-
-      if (failedJobs.length > 0) {
-        failedJobsText = failedJobs
-          .map((job) => {
-            const failedSteps = job.steps
-              .filter((s) => s.conclusion === "failure")
-              .map((s) => `    ↳ Step: **${s.name}**`)
-              .join("\n");
-            return `❌ **${job.name}**\n${failedSteps || "    ↳ Unknown step"}`;
-          })
-          .join("\n\n");
-      }
-    } catch {
-      failedJobsText = "Could not retrieve job details.";
+  if (steps.length > 0) {
+    lines.push("");
+    for (const step of steps) {
+      const icon = stepIcon(step.status, step.conclusion);
+      const dur  = getDuration(step.started_at, step.completed_at);
+      const time = dur ? `  \`${dur}\`` : "";
+      lines.push(`- ${icon} ${step.name}${time}`);
     }
   }
 
-  // This commit's additions and per-file breakdown
-  if (run.repository && run.head_sha) {
-    try {
-      const repoFullName = run.repository.full_name;
-      const sha = run.head_sha;
-      const commitData = await fetchJSON(
-        `https://api.github.com/repos/${repoFullName}/commits/${sha}`
-      );
+  return lines.join("\n");
+}
 
-      if (commitData.stats) {
-        locAdded = commitData.stats.additions || 0;
-      }
-
-      if (commitData.files?.length > 0) {
-        filesChanged = commitData.files.length;
-        fileLOCLines = commitData.files.map((f) => {
-          const name = f.filename.split("/").pop();
-          return `\`${name}\` — +${f.additions} / -${f.deletions} (${f.changes} changes)`;
-        });
-      }
-    } catch {
-      // Unavailable
-    }
+function sendToDiscord(content) {
+  if (!DISCORD_WEBHOOK_URL) {
+    console.warn("DISCORD_WEBHOOK_URL not set — printing to console instead:\n");
+    console.log(content);
+    return;
   }
 
-  const color = failed ? 0xe74c3c : 0x2ecc71;
-  const statusLabel = failed ? `❌ FAILED (${status})` : "✅ PASSED";
+  const body = JSON.stringify({ content });
+  const url  = new URL(DISCORD_WEBHOOK_URL);
 
-  const fields = [
-    {
-      name: "🔁 Workflow",
-      value: `\`${run.name}\``,
-      inline: true,
-    },
-    {
-      name: "📊 Status",
-      value: statusLabel,
-      inline: true,
-    },
-  ];
-
-  if (failed && failedJobsText) {
-    fields.push({
-      name: "💥 Failed Jobs & Steps",
-      value: failedJobsText.slice(0, 1024),
-      inline: false,
-    });
-  }
-
-  fields.push({
-    name: "📝 Lines Added (this commit)",
-    value: `**+${locAdded.toLocaleString()}** lines`,
-    inline: true,
-  });
-
-  fields.push({
-    name: "📁 Files Changed (this commit)",
-    value: `**${filesChanged}** file${filesChanged !== 1 ? "s" : ""}`,
-    inline: true,
-  });
-
-  if (fileLOCLines.length > 0) {
-    // Chunk file list into multiple fields to respect Discord's 1024 char limit
-    const chunks = [];
-    let current = "";
-    for (const line of fileLOCLines) {
-      const next = current ? current + "\n" + line : line;
-      if (next.length > 1024) {
-        chunks.push(current);
-        current = line;
-      } else {
-        current = next;
-      }
-    }
-    if (current) chunks.push(current);
-
-    // Max 25 fields in a Discord embed
-    const maxChunks = Math.min(chunks.length, 25 - fields.length);
-    chunks.slice(0, maxChunks).forEach((chunk, i) => {
-      fields.push({
-        name: i === 0
-          ? "📂 File Breakdown (this commit)"
-          : `📂 File Breakdown (cont. ${i + 1})`,
-        value: chunk,
-        inline: false,
-      });
-    });
-  }
-
-  const embed = {
-    title: failed
-      ? "🚨 GitHub Actions — Build Failed"
-      : "✅ GitHub Actions — Build Passed",
-    color,
-    fields,
-    footer: {
-      text: `Run #${run.run_number} • ${new Date(run.updated_at).toUTCString()}`,
+  const options = {
+    hostname: url.hostname,
+    path:     url.pathname + url.search,
+    method:   "POST",
+    headers:  {
+      "Content-Type":   "application/json",
+      "Content-Length": Buffer.byteLength(body),
     },
   };
 
-  await sendDiscordEmbed(embed);
+  const req = https.request(options, (res) => {
+    if (res.statusCode >= 400) {
+      console.error(`Discord webhook error: ${res.statusCode}`);
+    }
+  });
+  req.on("error", (err) => console.error("Discord request failed:", err.message));
+  req.write(body);
+  req.end();
 }
 
-const server = http.createServer(async (req, res) => {
-  if (req.method !== "POST") {
-    res.writeHead(405);
-    return res.end("Method Not Allowed");
+// ── HTTP server ───────────────────────────────────────────
+const server = http.createServer((req, res) => {
+  if (req.method !== "POST" || req.url !== "/webhook") {
+    res.writeHead(404);
+    return res.end("Not Found");
   }
 
-  const event = req.headers["x-github-event"];
-
-  try {
-    const payload = await parseBody(req);
-
-    if (event === "workflow_run") {
-      await handleWorkflowRun(payload);
-      res.writeHead(200);
-      res.end("OK");
-    } else {
-      res.writeHead(200);
-      res.end("Ignored");
+  let body = "";
+  req.on("data", (chunk) => (body += chunk));
+  req.on("end", () => {
+    const sig = req.headers["x-hub-signature-256"];
+    if (!verifySignature(body, sig)) {
+      res.writeHead(401);
+      return res.end("Unauthorized");
     }
-  } catch (err) {
-    console.error("Error:", err);
-    res.writeHead(500);
-    res.end("Internal Server Error");
-  }
+
+    let payload;
+    try { payload = JSON.parse(body); }
+    catch { res.writeHead(400); return res.end("Bad Request"); }
+
+    const event = req.headers["x-github-event"];
+    const repo  = payload.repository?.full_name ?? "unknown/repo";
+
+    if (event === "workflow_job") {
+      const job     = payload.workflow_job;
+      const steps   = job.steps ?? [];
+      const date    = formatDate(job.completed_at || job.started_at);
+      const message = buildMessage(repo, job.name, job.status, job.conclusion, date, steps);
+      sendToDiscord(message);
+
+    } else if (event === "workflow_run") {
+      const run     = payload.workflow_run;
+      const date    = formatDate(run.updated_at || run.created_at);
+      const message = buildMessage(repo, run.name, run.status, run.conclusion, date, []);
+      sendToDiscord(message);
+    }
+
+    res.writeHead(200);
+    res.end("OK");
+  });
 });
 
 server.listen(PORT, () => {
-  console.log(`Webhook server running on port ${PORT}`);
+  console.log(`GitHub webhook listening on :${PORT}/webhook`);
 });
