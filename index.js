@@ -1,4 +1,3 @@
-require("dotenv").config();
 const http   = require("http");
 const crypto = require("crypto");
 const https  = require("https");
@@ -48,9 +47,16 @@ function stepIcon(status, conclusion) {
   return "❓";
 }
 
-function buildMessage(repo, jobName, status, conclusion, date, steps) {
-  const label = conclusion || status;
+function embedColor(conclusion, status) {
+  if (conclusion === "success")   return 0x2ecc71; // green
+  if (conclusion === "failure")   return 0xe74c3c; // red
+  if (conclusion === "cancelled") return 0xf39c12; // orange
+  if (status === "in_progress")   return 0x3498db; // blue
+  return 0x95a5a6;                                  // gray
+}
 
+function buildEmbed(repo, jobName, status, conclusion, date, steps) {
+  const label = conclusion || status;
   const totalDuration = steps.length > 0
     ? getDuration(
         steps.find(s => s.started_at)?.started_at,
@@ -58,32 +64,49 @@ function buildMessage(repo, jobName, status, conclusion, date, steps) {
       )
     : null;
 
-  const lines = [];
-  lines.push(`- **${repo}**`);
-  lines.push(`  ${jobName} · ${label}${totalDuration ? ` · ${totalDuration}` : ""}`);
-  lines.push(`  ${date}`);
+  const stepLines = steps.map(step => {
+    const icon = stepIcon(step.status, step.conclusion);
+    const dur  = getDuration(step.started_at, step.completed_at);
+    return `- ${icon} ${step.name}${dur ? `  \`${dur}\`` : ""}`;
+  }).join("\n");
 
-  if (steps.length > 0) {
-    lines.push("");
-    for (const step of steps) {
-      const icon = stepIcon(step.status, step.conclusion);
-      const dur  = getDuration(step.started_at, step.completed_at);
-      const time = dur ? `  \`${dur}\`` : "";
-      lines.push(`- ${icon} ${step.name}${time}`);
-    }
-  }
-
-  return lines.join("\n");
+  return {
+    embeds: [{
+      title: `${repo}`,
+      color: embedColor(conclusion, status),
+      fields: [
+        {
+          name: "Job",
+          value: jobName,
+          inline: true,
+        },
+        {
+          name: "Status",
+          value: `${label}${totalDuration ? ` · \`${totalDuration}\`` : ""}`,
+          inline: true,
+        },
+        {
+          name: "Date",
+          value: date,
+          inline: true,
+        },
+        ...(stepLines ? [{
+          name: "Steps",
+          value: stepLines,
+          inline: false,
+        }] : []),
+      ],
+    }],
+  };
 }
 
-function sendToDiscord(content) {
+function sendToDiscord(payload) {
   if (!DISCORD_WEBHOOK_URL) {
-    console.warn("DISCORD_WEBHOOK_URL not set — printing to console instead:\n");
-    console.log(content);
+    console.log("DISCORD_WEBHOOK_URL not set:", JSON.stringify(payload, null, 2));
     return;
   }
 
-  const body = JSON.stringify({ content });
+  const body = JSON.stringify(payload);
   const url  = new URL(DISCORD_WEBHOOK_URL);
 
   const options = {
@@ -130,17 +153,17 @@ const server = http.createServer((req, res) => {
     const repo  = payload.repository?.full_name ?? "unknown/repo";
 
     if (event === "workflow_job") {
-      const job     = payload.workflow_job;
-      const steps   = job.steps ?? [];
-      const date    = formatDate(job.completed_at || job.started_at);
-      const message = buildMessage(repo, job.name, job.status, job.conclusion, date, steps);
-      sendToDiscord(message);
+      const job    = payload.workflow_job;
+      const steps  = job.steps ?? [];
+      const date   = formatDate(job.completed_at || job.started_at);
+      const embed  = buildEmbed(repo, job.name, job.status, job.conclusion, date, steps);
+      sendToDiscord(embed);
 
     } else if (event === "workflow_run") {
-      const run     = payload.workflow_run;
-      const date    = formatDate(run.updated_at || run.created_at);
-      const message = buildMessage(repo, run.name, run.status, run.conclusion, date, []);
-      sendToDiscord(message);
+      const run   = payload.workflow_run;
+      const date  = formatDate(run.updated_at || run.created_at);
+      const embed = buildEmbed(repo, run.name, run.status, run.conclusion, date, []);
+      sendToDiscord(embed);
     }
 
     res.writeHead(200);
